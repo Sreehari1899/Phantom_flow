@@ -52,7 +52,7 @@ def calculate_flow_rate():
         time.sleep(1)
         pulses = state["pulse_count"]
         state["pulse_count"] = 0
-        flow_lpm = pulses / 7.5
+        flow_lpm = (pulses * 60) / 3913
         state["flow_rate"] = round(flow_lpm * 1000, 1)
 
 # Start both threads
