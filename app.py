@@ -1,128 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>PeriFlow Dashboard</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Exo+2:wght@300;400;600;700&display=swap" rel="stylesheet"/>
+  <style>
+    :root {
+      --bg:        #0a0e1a;
+      --surface:   #111827;
+      --border:    #1e2d45;
+      --accent:    #00c8ff;
+      --accent2:   #00e676;
+      --warn:      #ff6b35;
+      --danger:    #ff3b5c;
+      --text:      #e2eaf5;
+      --muted:     #5a7090;
+      --card-bg:   #141d2e;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: var(--bg); color: var(--text); font-family: 'Exo 2', sans-serif; min-height: 100vh; padding: 24px 28px; }
 
-from flask import Flask, jsonify, request, send_from_directory
-import RPi.GPIO as GPIO
-import threading
-import time
+    header { display: flex; align-items: center; justify-content: space-between; padding: 0 4px 22px; border-bottom: 1px solid var(--border); margin-bottom: 28px; }
+    .logo { font-family: 'Share Tech Mono', monospace; font-size: 2.2rem; color: var(--accent); letter-spacing: 4px; }
+    .logo span { color: var(--text); }
+    .status-pill { display: flex; align-items: center; gap: 10px; font-size: 1.1rem; color: var(--muted); font-family: 'Share Tech Mono', monospace; }
+    .status-dot { width: 14px; height: 14px; border-radius: 50%; background: var(--muted); transition: background 0.4s, box-shadow 0.4s; }
+    .status-dot.active { background: var(--accent2); box-shadow: 0 0 12px var(--accent2); animation: dotPulse 1.2s infinite; }
+    @keyframes dotPulse { 0%,100%{opacity:1;} 50%{opacity:.4;} }
 
-app = Flask(__name__, static_folder='static')
+    .grid { display: grid; gap: 20px; }
+    .row { display: grid; gap: 20px; }
+    .row-3 { grid-template-columns: repeat(3, 1fr); }
+    @media(max-width:900px) { .row-3 { grid-template-columns:1fr; } }
 
-# --- GPIO Setup ---
-GPIO.cleanup()
-GPIO.setmode(GPIO.BCM)
-GPIO.setwarnings(False)
+    .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 16px; padding: 26px 30px; position: relative; overflow: hidden; }
+    .card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px; background: linear-gradient(90deg, transparent, var(--accent), transparent); opacity: 0.3; }
+    .card.highlight::before { opacity: 1; }
+    .card-label { font-size: 1rem; font-family: 'Share Tech Mono', monospace; color: var(--muted); letter-spacing: 2px; text-transform: uppercase; margin-bottom: 14px; }
+    .card-value { font-size: 3.8rem; font-weight: 700; color: var(--accent); line-height: 1; font-family: 'Share Tech Mono', monospace; }
+    .card-value.green  { color: var(--accent2); }
+    .card-value.orange { color: var(--warn); }
+    .card-unit { font-size: 1.05rem; color: var(--muted); margin-top: 10px; font-family: 'Share Tech Mono', monospace; }
 
-EN1 = 18
-IN1 = 17
-IN2 = 27
-FLOW_SENSOR_PIN = 24
+    .flow-dot { display: inline-block; width: 12px; height: 12px; border-radius: 50%; background: var(--accent2); margin-left: 8px; vertical-align: middle; opacity: 0; transition: opacity 0.25s; box-shadow: 0 0 8px var(--accent2); }
 
-GPIO.setup(EN1, GPIO.OUT)
-GPIO.setup(IN1, GPIO.OUT)
-GPIO.setup(IN2, GPIO.OUT)
-GPIO.setup(FLOW_SENSOR_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    .chart-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 16px; padding: 24px 28px 18px; }
+    .chart-card .card-label { margin-bottom: 16px; }
+    canvas { width: 100% !important; }
 
-# PWM at 1000Hz
-pwm = GPIO.PWM(EN1, 1000)
-pwm.start(0)
+    .controls-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 16px; padding: 28px 32px; }
+    .controls-card .card-label { margin-bottom: 22px; font-size: 1rem; }
+    .control-row { display: flex; align-items: center; gap: 18px; margin-bottom: 24px; }
+    .control-row:last-child { margin-bottom: 0; }
+    .control-label { font-size: 1rem; font-family: 'Share Tech Mono', monospace; color: var(--muted); width: 130px; flex-shrink: 0; letter-spacing: 1px; }
 
-# --- State ---
-state = {
-    "running": False,
-    "duty_cycle": 0,
-    "direction": "forward",
-    "flow_rate": 0.0,
-    "target_flow": 0.0,
-    "voltage": 11.6,
-    "pulse_count": 0,
-}
+    input[type=number] { background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 10px; padding: 14px 16px; font-family: 'Share Tech Mono', monospace; font-size: 1.3rem; outline: none; transition: border-color 0.2s; width: 120px; }
+    input[type=number]:focus { border-color: var(--accent); box-shadow: 0 0 8px rgba(0,200,255,0.15); }
 
-# --- Flow Sensor (polling instead of interrupt) ---
-def monitor_flow():
-    last_state = GPIO.input(FLOW_SENSOR_PIN)
-    while True:
-        current_state = GPIO.input(FLOW_SENSOR_PIN)
-        # Detect falling edge manually
-        if last_state == 1 and current_state == 0:
-            state["pulse_count"] += 1
-        last_state = current_state
-        time.sleep(0.001)  # poll every 1ms
+    input[type=range] { -webkit-appearance: none; flex: 1; height: 10px; padding: 0; border: none; background: var(--border); border-radius: 5px; cursor: pointer; }
+    input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 28px; height: 28px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 10px var(--accent); cursor: pointer; }
+    .range-val { font-family: 'Share Tech Mono', monospace; font-size: 1.15rem; color: var(--accent); width: 80px; text-align: right; }
 
-def calculate_flow_rate():
-    while True:
-        time.sleep(1)
-        pulses = state["pulse_count"]
-        state["pulse_count"] = 0
-        flow_lpm = (pulses * 60) / 3913
-        state["flow_rate"] = round(flow_lpm * 1000, 1)
+    .btn { border: none; border-radius: 12px; padding: 16px 38px; font-family: 'Exo 2', sans-serif; font-size: 1.2rem; font-weight: 700; cursor: pointer; transition: all 0.2s; letter-spacing: 2px; text-transform: uppercase; }
+    .btn-start { background: linear-gradient(135deg, #00c8ff15, #00c8ff35); border: 2px solid var(--accent); color: var(--accent); }
+    .btn-start:hover { background: #00c8ff33; box-shadow: 0 0 20px #00c8ff44; }
+    .btn-stop { background: linear-gradient(135deg, #ff3b5c15, #ff3b5c35); border: 2px solid var(--danger); color: var(--danger); }
+    .btn-stop:hover { background: #ff3b5c33; box-shadow: 0 0 20px #ff3b5c44; }
+    .btn-dir { background: transparent; border: 2px solid var(--border); color: var(--muted); padding: 14px 24px; font-size: 1.05rem; border-radius: 10px; cursor: pointer; font-family: 'Exo 2', sans-serif; font-weight: 600; letter-spacing: 1px; transition: all 0.2s; }
+    .btn-dir.active { border-color: var(--accent2); color: var(--accent2); background: rgba(0,230,118,0.08); }
+    .btn-reset { background: transparent; border: 2px solid var(--border); color: var(--muted); font-size: 1rem; padding: 10px 20px; border-radius: 10px; cursor: pointer; font-family: 'Exo 2', sans-serif; font-weight: 600; transition: all 0.2s; }
+    .btn-reset:hover { border-color: var(--muted); color: var(--text); }
+    .btn-row { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
 
-# Start both threads
-threading.Thread(target=monitor_flow, daemon=True).start()
-threading.Thread(target=calculate_flow_rate, daemon=True).start()
+    .spinner-wrap { display: flex; align-items: center; }
+    .spinner { width: 34px; height: 34px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; opacity: 0; transition: opacity 0.4s; }
+    .spinner.active { opacity: 1; animation: spin 0.8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
 
-# --- Pump Control ---
-def set_direction(direction):
-    if direction == "forward":
-        GPIO.output(IN1, GPIO.HIGH)
-        GPIO.output(IN2, GPIO.LOW)
-    else:
-        GPIO.output(IN1, GPIO.LOW)
-        GPIO.output(IN2, GPIO.HIGH)
+    .section-divider { font-family: 'Share Tech Mono', monospace; font-size: 0.9rem; color: var(--muted); letter-spacing: 3px; text-transform: uppercase; margin: 6px 0 12px; display: flex; align-items: center; gap: 12px; }
+    .section-divider::after { content: ''; flex: 1; height: 1px; background: var(--border); }
 
-def stop_pump():
-    pwm.ChangeDutyCycle(0)
-    GPIO.output(IN1, GPIO.LOW)
-    GPIO.output(IN2, GPIO.LOW)
-    state["running"] = False
-    state["duty_cycle"] = 0
+    .info-row { display: flex; gap: 30px; flex-wrap: wrap; padding: 10px 0 0; }
+    .info-item { font-family: 'Share Tech Mono', monospace; font-size: 1.05rem; color: var(--muted); }
+    .info-item span { color: var(--text); }
 
-# --- API Routes ---
-@app.route('/')
-def index():
-    return send_from_directory('static', 'index.html')
+    .mode-badge { display: inline-block; font-family: 'Share Tech Mono', monospace; font-size: 0.8rem; padding: 3px 10px; border-radius: 6px; letter-spacing: 1px; text-transform: uppercase; margin-left: 10px; }
+    .mode-badge.continuous { background: rgba(0,230,118,0.12); color: var(--accent2); border: 1px solid rgba(0,230,118,0.3); }
+    .mode-badge.pulsed { background: rgba(255,107,53,0.12); color: var(--warn); border: 1px solid rgba(255,107,53,0.3); }
+  </style>
+</head>
+<body>
 
-@app.route('/api/status')
-def get_status():
-    return jsonify({
-        "running": state["running"],
-        "flow_rate": state["flow_rate"],
-        "target_flow": state["target_flow"],
-        "duty_cycle": state["duty_cycle"],
-        "direction": state["direction"],
-        "voltage": state["voltage"],
-    })
+<header>
+  <div class="logo">PERI<span>FLOW</span></div>
+  <div class="status-pill">
+    <div class="status-dot" id="statusDot"></div>
+    <span id="statusText">STOPPED</span>
+    <span class="mode-badge" id="modeBadge" style="display:none;"></span>
+  </div>
+</header>
 
-@app.route('/api/start', methods=['POST'])
-def start_pump():
-    set_direction(state["direction"])
-    pwm.ChangeDutyCycle(state["duty_cycle"])
-    state["running"] = True
-    return jsonify({"status": "started"})
+<div class="grid">
 
-@app.route('/api/stop', methods=['POST'])
-def stop():
-    stop_pump()
-    return jsonify({"status": "stopped"})
+  <div class="section-divider">Flow Metrics</div>
+  <div class="row row-3">
+    <div class="card highlight">
+      <div class="card-label">Live Flow Rate</div>
+      <div class="card-value" id="flowRate">0.0</div>
+      <div class="card-unit">mL / min <span class="flow-dot" id="flowDot"></span></div>
+    </div>
+    <div class="card">
+      <div class="card-label">Total Volume</div>
+      <div class="card-value green" id="totalVolume">0.00</div>
+      <div class="card-unit">mL <button class="btn btn-reset" id="resetBtn" style="margin-left:12px;">Reset</button></div>
+    </div>
+    <div class="card">
+      <div class="card-label">Elapsed Time</div>
+      <div class="card-value orange" id="elapsedTime">00:00</div>
+      <div class="card-unit">since last reset</div>
+    </div>
+  </div>
 
-@app.route('/api/set', methods=['POST'])
-def set_flow():
-    data = request.json
-    target = float(data.get("target_flow", 0))
-    direction = data.get("direction", "forward")
-    duty = min(100, max(0, target))
-    state["target_flow"] = target
-    state["direction"] = direction
-    state["duty_cycle"] = duty
-    if state["running"]:
-        set_direction(direction)
-        pwm.ChangeDutyCycle(duty)
-    return jsonify({"status": "updated", "duty_cycle": duty})
+  <div class="chart-card">
+    <div class="card-label">Flow Rate History &mdash; actual vs target (last 40s)</div>
+    <canvas id="flowChart" height="100"></canvas>
+  </div>
 
-if __name__ == '__main__':
-    try:
-        app.run(host='0.0.0.0', port=5000, debug=False)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        pwm.stop()
-        GPIO.cleanup()
-EOF
+  <div class="section-divider">Controls</div>
+  <div class="controls-card">
+    <div class="control-row">
+      <div class="control-label">Start / Stop</div>
+      <div class="btn-row">
+        <div class="spinner-wrap"><div class="spinner" id="spinner"></div></div>
+        <button class="btn btn-start" id="startBtn">Start</button>
+        <button class="btn btn-stop"  id="stopBtn">Stop</button>
+      </div>
+    </div>
+    <div class="control-row">
+      <div class="control-label">Flow Rate</div>
+      <input type="number" id="flowInput" value="50" min="10" max="110"/>
+      <input type="range"  id="flowSlider" value="50" min="10" max="110"/>
+      <div class="range-val" id="flowVal">50 mL</div>
+    </div>
+    <div class="control-row">
+      <div class="control-label">Direction</div>
+      <div class="btn-row">
+        <button class="btn btn-dir active" id="btnFwd">&#10230; Forward</button>
+        <button class="btn btn-dir"        id="btnRev">&#10229; Reverse</button>
+      </div>
+    </div>
+    <div class="info-row">
+      <div class="info-item">Target: <span id="targetFlow">0.0</span> mL/min</div>
+      <div class="info-item">Voltage: <span id="voltage">11.6</span>V</div>
+      <div class="info-item">Current: <span>0.23</span>A</div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+
+  var direction = 'forward';
+
+  var chart = null;
+  var actualData = Array(40).fill(0);
+  var targetData = Array(40).fill(0);
+  try {
+    var ctx = document.getElementById('flowChart').getContext('2d');
+    chart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: Array(40).fill(''),
+        datasets: [
+          { label: 'Actual', data: actualData, borderColor: '#00c8ff', backgroundColor: 'rgba(0,200,255,0.07)', borderWidth: 2.5, pointRadius: 0, tension: 0.4, fill: true },
+          { label: 'Target', data: targetData, borderColor: '#00e676', borderDash: [4,4], borderWidth: 2, pointRadius: 0, tension: 0, fill: false }
+        ]
+      },
+      options: {
+        responsive: true, animation: false,
+        scales: {
+          x: { display: false },
+          y: { min: 0, max: 140, grid: { color: '#1e2d45' },
+            ticks: { color: '#5a7090', font: { family: 'Share Tech Mono', size: 13 }, callback: function(v){ return v + ' mL'; } }
+          }
+        },
+        plugins: { legend: { labels: { color: '#5a7090', font: { family: 'Share Tech Mono', size: 13 }, boxWidth: 14 } } }
+      }
+    });
+  } catch(e) { console.warn('Chart init failed:', e); }
+
+  function post(url, body) {
+    return fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {})
+    }).catch(function(e){ console.error(url + ' failed:', e); });
+  }
+
+  function applySettings() {
+    var flow = parseFloat(document.getElementById('flowInput').value) || 0;
+    return post('/api/set', { target_flow: flow, direction: direction });
+  }
+
+  document.getElementById('startBtn').addEventListener('click', function () {
+    var flow = parseFloat(document.getElementById('flowInput').value) || 0;
+    post('/api/start', { target_flow: flow, direction: direction });
+  });
+
+  document.getElementById('stopBtn').addEventListener('click', function () {
+    post('/api/stop');
+  });
+
+  document.getElementById('resetBtn').addEventListener('click', function () {
+    post('/api/reset_volume');
+  });
+
+  document.getElementById('btnFwd').addEventListener('click', function () {
+    direction = 'forward';
+    document.getElementById('btnFwd').classList.add('active');
+    document.getElementById('btnRev').classList.remove('active');
+    applySettings();
+  });
+
+  document.getElementById('btnRev').addEventListener('click', function () {
+    direction = 'reverse';
+    document.getElementById('btnRev').classList.add('active');
+    document.getElementById('btnFwd').classList.remove('active');
+    applySettings();
+  });
+
+  document.getElementById('flowInput').addEventListener('input', function () {
+    document.getElementById('flowSlider').value = this.value;
+    document.getElementById('flowVal').textContent = this.value + ' mL';
+    applySettings();
+  });
+
+  document.getElementById('flowSlider').addEventListener('input', function () {
+    document.getElementById('flowInput').value = this.value;
+    document.getElementById('flowVal').textContent = this.value + ' mL';
+    applySettings();
+  });
+
+  function poll() {
+    fetch('/api/status')
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+
+        var dot = document.getElementById('statusDot');
+        document.getElementById('statusText').textContent = data.running ? 'RUNNING' : 'STOPPED';
+        data.running ? dot.classList.add('active') : dot.classList.remove('active');
+        document.getElementById('spinner').classList.toggle('active', data.running);
+
+        // Mode badge
+        var badge = document.getElementById('modeBadge');
+        if (data.running) {
+          badge.style.display = 'inline-block';
+          badge.textContent = data.mode;
+          badge.className = 'mode-badge ' + data.mode;
+        } else {
+          badge.style.display = 'none';
+        }
+
+        document.getElementById('flowRate').textContent    = data.flow_rate.toFixed(1);
+        document.getElementById('targetFlow').textContent  = data.target_flow.toFixed(1);
+        document.getElementById('voltage').textContent     = data.voltage.toFixed(1);
+        document.getElementById('totalVolume').textContent = data.total_volume.toFixed(2);
+
+        if (data.flow_rate > 0 && data.running) {
+          var fd = document.getElementById('flowDot');
+          fd.style.opacity = '1';
+          setTimeout(function(){ fd.style.opacity = '0'; }, 300);
+        }
+
+        var sec = data.volume_time;
+        document.getElementById('elapsedTime').textContent =
+          String(Math.floor(sec / 60)).padStart(2, '0') + ':' + String(sec % 60).padStart(2, '0');
+
+        if (chart) {
+          actualData.shift(); actualData.push(data.flow_rate);
+          targetData.shift(); targetData.push(data.target_flow);
+          chart.update();
+        }
+
+      })
+      .catch(function(e) { console.error('Poll error:', e); })
+      .finally(function() { setTimeout(poll, 1000); });
+  }
+
+  poll();
+
+}); // end DOMContentLoaded
+</script>
+
+</body>
+</html>
