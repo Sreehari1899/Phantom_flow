@@ -1,299 +1,132 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>PeriFlow Dashboard</title>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
-  <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Exo+2:wght@300;400;600;700&display=swap" rel="stylesheet"/>
-  <style>
-    :root {
-      --bg:        #0a0e1a;
-      --surface:   #111827;
-      --border:    #1e2d45;
-      --accent:    #00c8ff;
-      --accent2:   #00e676;
-      --warn:      #ff6b35;
-      --danger:    #ff3b5c;
-      --text:      #e2eaf5;
-      --muted:     #5a7090;
-      --card-bg:   #141d2e;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background: var(--bg); color: var(--text); font-family: 'Exo 2', sans-serif; min-height: 100vh; padding: 24px 28px; }
+from flask import Flask,jsonify,request,send_from_directory
+import RPi.GPIO as GPIO,threading,time
 
-    header { display: flex; align-items: center; justify-content: space-between; padding: 0 4px 22px; border-bottom: 1px solid var(--border); margin-bottom: 28px; }
-    .logo { font-family: 'Share Tech Mono', monospace; font-size: 2.2rem; color: var(--accent); letter-spacing: 4px; }
-    .logo span { color: var(--text); }
-    .status-pill { display: flex; align-items: center; gap: 10px; font-size: 1.1rem; color: var(--muted); font-family: 'Share Tech Mono', monospace; }
-    .status-dot { width: 14px; height: 14px; border-radius: 50%; background: var(--muted); transition: background 0.4s, box-shadow 0.4s; }
-    .status-dot.active { background: var(--accent2); box-shadow: 0 0 12px var(--accent2); animation: dotPulse 1.2s infinite; }
-    @keyframes dotPulse { 0%,100%{opacity:1;} 50%{opacity:.4;} }
+app=Flask(__name__,static_folder='static')
+GPIO.cleanup();GPIO.setmode(GPIO.BCM);GPIO.setwarnings(False)
+EN1,IN1,IN2,FLOW_PIN=18,17,27,24
+for p in[EN1,IN1,IN2]:GPIO.setup(p,GPIO.OUT)
+GPIO.setup(FLOW_PIN,GPIO.IN,pull_up_down=GPIO.PUD_UP)
+pwm=GPIO.PWM(EN1,1000);pwm.start(0)
 
-    .grid { display: grid; gap: 20px; }
-    .row { display: grid; gap: 20px; }
-    .row-3 { grid-template-columns: repeat(3, 1fr); }
-    @media(max-width:900px) { .row-3 { grid-template-columns:1fr; } }
+# ── Calibration (from real measurements) ──────────────────────
+# 85% duty  -> 46 mL/min  (minimum where motor spins)
+# 100% duty -> 110 mL/min (measured max)
+# Pulse factor: 2700 (calibrated from sensor)
+MIN_DUTY    = 85
+MIN_FLOW    = 46.0
+MAX_FLOW    = 110.0
+PULSE_FACTOR= 2700
+PULSE_CYCLE = 10      # seconds per ON/OFF cycle for pulsed mode
 
-    .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 16px; padding: 26px 30px; position: relative; overflow: hidden; }
-    .card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px; background: linear-gradient(90deg, transparent, var(--accent), transparent); opacity: 0.3; }
-    .card.highlight::before { opacity: 1; }
-    .card-label { font-size: 1rem; font-family: 'Share Tech Mono', monospace; color: var(--muted); letter-spacing: 2px; text-transform: uppercase; margin-bottom: 14px; }
-    .card-value { font-size: 3.8rem; font-weight: 700; color: var(--accent); line-height: 1; font-family: 'Share Tech Mono', monospace; }
-    .card-value.green  { color: var(--accent2); }
-    .card-value.orange { color: var(--warn); }
-    .card-unit { font-size: 1.05rem; color: var(--muted); margin-top: 10px; font-family: 'Share Tech Mono', monospace; }
+s={'running':False,'duty':0,'dir':'forward','flow':0.0,'target':0.0,
+   'voltage':11.6,'pulses':0,'volume':0.0,'t':0,'mode':'continuous'}
 
-    .flow-dot { display: inline-block; width: 12px; height: 12px; border-radius: 50%; background: var(--accent2); margin-left: 8px; vertical-align: middle; opacity: 0; transition: opacity 0.25s; box-shadow: 0 0 8px var(--accent2); }
+# ── Helpers ───────────────────────────────────────────────────
+def duty_for_flow(f):
+    """Duty cycle for continuous mode (flows >= MIN_FLOW)."""
+    if f<=0:return 0
+    return round(min(100,MIN_DUTY+(f-MIN_FLOW)*(100-MIN_DUTY)/(MAX_FLOW-MIN_FLOW)),1)
 
-    .chart-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 16px; padding: 24px 28px 18px; }
-    .chart-card .card-label { margin-bottom: 16px; }
-    canvas { width: 100% !important; }
+def dirset(d):
+    GPIO.output(IN1,GPIO.HIGH if d=='forward' else GPIO.LOW)
+    GPIO.output(IN2,GPIO.LOW if d=='forward' else GPIO.HIGH)
 
-    .controls-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 16px; padding: 28px 32px; }
-    .controls-card .card-label { margin-bottom: 22px; font-size: 1rem; }
-    .control-row { display: flex; align-items: center; gap: 18px; margin-bottom: 24px; }
-    .control-row:last-child { margin-bottom: 0; }
-    .control-label { font-size: 1rem; font-family: 'Share Tech Mono', monospace; color: var(--muted); width: 130px; flex-shrink: 0; letter-spacing: 1px; }
+def do_stop():
+    pwm.ChangeDutyCycle(0);GPIO.output(IN1,GPIO.LOW);GPIO.output(IN2,GPIO.LOW)
+    s['running']=False;s['duty']=0;s['mode']='continuous'
 
-    input[type=number] { background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 10px; padding: 14px 16px; font-family: 'Share Tech Mono', monospace; font-size: 1.3rem; outline: none; transition: border-color 0.2s; width: 120px; }
-    input[type=number]:focus { border-color: var(--accent); box-shadow: 0 0 8px rgba(0,200,255,0.15); }
+# ── Thread 1: Flow sensor pulse counter ──────────────────────
+def monitor():
+    prev=GPIO.input(FLOW_PIN)
+    while True:
+        cur=GPIO.input(FLOW_PIN)
+        if prev==1 and cur==0:s['pulses']+=1
+        prev=cur;time.sleep(0.001)
 
-    input[type=range] { -webkit-appearance: none; flex: 1; height: 10px; padding: 0; border: none; background: var(--border); border-radius: 5px; cursor: pointer; }
-    input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 28px; height: 28px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 10px var(--accent); cursor: pointer; }
-    .range-val { font-family: 'Share Tech Mono', monospace; font-size: 1.15rem; color: var(--accent); width: 80px; text-align: right; }
+# ── Thread 2: Flow rate calculation (every 1s) ──────────────
+def calc():
+    while True:
+        time.sleep(1)
+        p=s['pulses'];s['pulses']=0
+        new_flow=round((p*60/PULSE_FACTOR)*1000,1)
+        s['flow']=round((s['flow']+new_flow)/2,1)
+        if s['running']:
+            ml=round(s['flow']/60,3)
+            s['volume']=round(s['volume']+ml,2);s['t']+=1
 
-    .btn { border: none; border-radius: 12px; padding: 16px 38px; font-family: 'Exo 2', sans-serif; font-size: 1.2rem; font-weight: 700; cursor: pointer; transition: all 0.2s; letter-spacing: 2px; text-transform: uppercase; }
-    .btn-start { background: linear-gradient(135deg, #00c8ff15, #00c8ff35); border: 2px solid var(--accent); color: var(--accent); }
-    .btn-start:hover { background: #00c8ff33; box-shadow: 0 0 20px #00c8ff44; }
-    .btn-stop { background: linear-gradient(135deg, #ff3b5c15, #ff3b5c35); border: 2px solid var(--danger); color: var(--danger); }
-    .btn-stop:hover { background: #ff3b5c33; box-shadow: 0 0 20px #ff3b5c44; }
-    .btn-dir { background: transparent; border: 2px solid var(--border); color: var(--muted); padding: 14px 24px; font-size: 1.05rem; border-radius: 10px; cursor: pointer; font-family: 'Exo 2', sans-serif; font-weight: 600; letter-spacing: 1px; transition: all 0.2s; }
-    .btn-dir.active { border-color: var(--accent2); color: var(--accent2); background: rgba(0,230,118,0.08); }
-    .btn-reset { background: transparent; border: 2px solid var(--border); color: var(--muted); font-size: 1rem; padding: 10px 20px; border-radius: 10px; cursor: pointer; font-family: 'Exo 2', sans-serif; font-weight: 600; transition: all 0.2s; }
-    .btn-reset:hover { border-color: var(--muted); color: var(--text); }
-    .btn-row { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
+# ── Thread 3: Pump control (owns all PWM output) ────────────
+def pump_control():
+    while True:
+        if not s['running'] or s['target']<=0:
+            time.sleep(0.5)
+            continue
 
-    .spinner-wrap { display: flex; align-items: center; }
-    .spinner { width: 34px; height: 34px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; opacity: 0; transition: opacity 0.4s; }
-    .spinner.active { opacity: 1; animation: spin 0.8s linear infinite; }
-    @keyframes spin { to { transform: rotate(360deg); } }
+        target=s['target']
 
-    .section-divider { font-family: 'Share Tech Mono', monospace; font-size: 0.9rem; color: var(--muted); letter-spacing: 3px; text-transform: uppercase; margin: 6px 0 12px; display: flex; align-items: center; gap: 12px; }
-    .section-divider::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+        if target>=MIN_FLOW:
+            # CONTINUOUS MODE: steady PWM
+            s['mode']='continuous'
+            dc=duty_for_flow(target)
+            dirset(s['dir']);pwm.ChangeDutyCycle(dc);s['duty']=dc
+            time.sleep(1)
+        else:
+            # PULSED MODE: burst at MIN_DUTY, then off
+            s['mode']='pulsed'
+            on_ratio=target/MIN_FLOW
+            on_time=max(0.5,round(on_ratio*PULSE_CYCLE,1))
+            off_time=round(PULSE_CYCLE-on_time,1)
 
-    .info-row { display: flex; gap: 30px; flex-wrap: wrap; padding: 10px 0 0; }
-    .info-item { font-family: 'Share Tech Mono', monospace; font-size: 1.05rem; color: var(--muted); }
-    .info-item span { color: var(--text); }
+            # ON phase
+            if s['running'] and s['target']<MIN_FLOW:
+                dirset(s['dir']);pwm.ChangeDutyCycle(MIN_DUTY);s['duty']=MIN_DUTY
+                time.sleep(on_time)
 
-    .mode-badge { display: inline-block; font-family: 'Share Tech Mono', monospace; font-size: 0.8rem; padding: 3px 10px; border-radius: 6px; letter-spacing: 1px; text-transform: uppercase; margin-left: 10px; }
-    .mode-badge.continuous { background: rgba(0,230,118,0.12); color: var(--accent2); border: 1px solid rgba(0,230,118,0.3); }
-    .mode-badge.pulsed { background: rgba(255,107,53,0.12); color: var(--warn); border: 1px solid rgba(255,107,53,0.3); }
-  </style>
-</head>
-<body>
+            # OFF phase
+            if s['running'] and s['target']<MIN_FLOW:
+                pwm.ChangeDutyCycle(0);s['duty']=0
+                time.sleep(off_time)
 
-<header>
-  <div class="logo">PERI<span>FLOW</span></div>
-  <div class="status-pill">
-    <div class="status-dot" id="statusDot"></div>
-    <span id="statusText">STOPPED</span>
-    <span class="mode-badge" id="modeBadge" style="display:none;"></span>
-  </div>
-</header>
+threading.Thread(target=monitor,daemon=True).start()
+threading.Thread(target=calc,daemon=True).start()
+threading.Thread(target=pump_control,daemon=True).start()
 
-<div class="grid">
+# ── API Routes ───────────────────────────────────────────────
+@app.route('/')
+def index():return send_from_directory('static','index.html')
 
-  <div class="section-divider">Flow Metrics</div>
-  <div class="row row-3">
-    <div class="card highlight">
-      <div class="card-label">Live Flow Rate</div>
-      <div class="card-value" id="flowRate">0.0</div>
-      <div class="card-unit">mL / min <span class="flow-dot" id="flowDot"></span></div>
-    </div>
-    <div class="card">
-      <div class="card-label">Total Volume</div>
-      <div class="card-value green" id="totalVolume">0.00</div>
-      <div class="card-unit">mL <button class="btn btn-reset" id="resetBtn" style="margin-left:12px;">Reset</button></div>
-    </div>
-    <div class="card">
-      <div class="card-label">Elapsed Time</div>
-      <div class="card-value orange" id="elapsedTime">00:00</div>
-      <div class="card-unit">since last reset</div>
-    </div>
-  </div>
+@app.route('/api/status')
+def status():
+    return jsonify({'running':s['running'],'flow_rate':s['flow'],'target_flow':s['target'],
+        'duty_cycle':s['duty'],'direction':s['dir'],'voltage':s['voltage'],
+        'total_volume':s['volume'],'volume_time':s['t'],'mode':s['mode']})
 
-  <div class="chart-card">
-    <div class="card-label">Flow Rate History &mdash; actual vs target (last 40s)</div>
-    <canvas id="flowChart" height="100"></canvas>
-  </div>
+@app.route('/api/start',methods=['POST'])
+def start():
+    d=request.json or {}
+    s['target']=float(d.get('target_flow',s['target']))
+    s['dir']=d.get('direction',s['dir'])
+    s['running']=True
+    # pump_control thread handles all PWM from here
+    return jsonify({'status':'started'})
 
-  <div class="section-divider">Controls</div>
-  <div class="controls-card">
-    <div class="control-row">
-      <div class="control-label">Start / Stop</div>
-      <div class="btn-row">
-        <div class="spinner-wrap"><div class="spinner" id="spinner"></div></div>
-        <button class="btn btn-start" id="startBtn">Start</button>
-        <button class="btn btn-stop"  id="stopBtn">Stop</button>
-      </div>
-    </div>
-    <div class="control-row">
-      <div class="control-label">Flow Rate</div>
-      <input type="number" id="flowInput" value="50" min="10" max="110"/>
-      <input type="range"  id="flowSlider" value="50" min="10" max="110"/>
-      <div class="range-val" id="flowVal">50 mL</div>
-    </div>
-    <div class="control-row">
-      <div class="control-label">Direction</div>
-      <div class="btn-row">
-        <button class="btn btn-dir active" id="btnFwd">&#10230; Forward</button>
-        <button class="btn btn-dir"        id="btnRev">&#10229; Reverse</button>
-      </div>
-    </div>
-    <div class="info-row">
-      <div class="info-item">Target: <span id="targetFlow">0.0</span> mL/min</div>
-      <div class="info-item">Voltage: <span id="voltage">11.6</span>V</div>
-      <div class="info-item">Current: <span>0.23</span>A</div>
-    </div>
-  </div>
+@app.route('/api/stop',methods=['POST'])
+def stop():
+    do_stop();return jsonify({'status':'stopped'})
 
-</div>
+@app.route('/api/set',methods=['POST'])
+def setflow():
+    d=request.json
+    s['target']=float(d.get('target_flow',0))
+    s['dir']=d.get('direction','forward')
+    # pump_control thread picks up changes automatically
+    return jsonify({'status':'updated'})
 
-<script>
-document.addEventListener('DOMContentLoaded', function () {
+@app.route('/api/reset_volume',methods=['POST'])
+def reset():
+    s['volume']=0.0;s['t']=0
+    return jsonify({'status':'reset'})
 
-  var direction = 'forward';
-
-  var chart = null;
-  var actualData = Array(40).fill(0);
-  var targetData = Array(40).fill(0);
-  try {
-    var ctx = document.getElementById('flowChart').getContext('2d');
-    chart = new Chart(ctx, {
-      type: 'line',
-      data: {
-        labels: Array(40).fill(''),
-        datasets: [
-          { label: 'Actual', data: actualData, borderColor: '#00c8ff', backgroundColor: 'rgba(0,200,255,0.07)', borderWidth: 2.5, pointRadius: 0, tension: 0.4, fill: true },
-          { label: 'Target', data: targetData, borderColor: '#00e676', borderDash: [4,4], borderWidth: 2, pointRadius: 0, tension: 0, fill: false }
-        ]
-      },
-      options: {
-        responsive: true, animation: false,
-        scales: {
-          x: { display: false },
-          y: { min: 0, max: 140, grid: { color: '#1e2d45' },
-            ticks: { color: '#5a7090', font: { family: 'Share Tech Mono', size: 13 }, callback: function(v){ return v + ' mL'; } }
-          }
-        },
-        plugins: { legend: { labels: { color: '#5a7090', font: { family: 'Share Tech Mono', size: 13 }, boxWidth: 14 } } }
-      }
-    });
-  } catch(e) { console.warn('Chart init failed:', e); }
-
-  function post(url, body) {
-    return fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body || {})
-    }).catch(function(e){ console.error(url + ' failed:', e); });
-  }
-
-  function applySettings() {
-    var flow = parseFloat(document.getElementById('flowInput').value) || 0;
-    return post('/api/set', { target_flow: flow, direction: direction });
-  }
-
-  document.getElementById('startBtn').addEventListener('click', function () {
-    var flow = parseFloat(document.getElementById('flowInput').value) || 0;
-    post('/api/start', { target_flow: flow, direction: direction });
-  });
-
-  document.getElementById('stopBtn').addEventListener('click', function () {
-    post('/api/stop');
-  });
-
-  document.getElementById('resetBtn').addEventListener('click', function () {
-    post('/api/reset_volume');
-  });
-
-  document.getElementById('btnFwd').addEventListener('click', function () {
-    direction = 'forward';
-    document.getElementById('btnFwd').classList.add('active');
-    document.getElementById('btnRev').classList.remove('active');
-    applySettings();
-  });
-
-  document.getElementById('btnRev').addEventListener('click', function () {
-    direction = 'reverse';
-    document.getElementById('btnRev').classList.add('active');
-    document.getElementById('btnFwd').classList.remove('active');
-    applySettings();
-  });
-
-  document.getElementById('flowInput').addEventListener('input', function () {
-    document.getElementById('flowSlider').value = this.value;
-    document.getElementById('flowVal').textContent = this.value + ' mL';
-    applySettings();
-  });
-
-  document.getElementById('flowSlider').addEventListener('input', function () {
-    document.getElementById('flowInput').value = this.value;
-    document.getElementById('flowVal').textContent = this.value + ' mL';
-    applySettings();
-  });
-
-  function poll() {
-    fetch('/api/status')
-      .then(function(r) { return r.json(); })
-      .then(function(data) {
-
-        var dot = document.getElementById('statusDot');
-        document.getElementById('statusText').textContent = data.running ? 'RUNNING' : 'STOPPED';
-        data.running ? dot.classList.add('active') : dot.classList.remove('active');
-        document.getElementById('spinner').classList.toggle('active', data.running);
-
-        // Mode badge
-        var badge = document.getElementById('modeBadge');
-        if (data.running) {
-          badge.style.display = 'inline-block';
-          badge.textContent = data.mode;
-          badge.className = 'mode-badge ' + data.mode;
-        } else {
-          badge.style.display = 'none';
-        }
-
-        document.getElementById('flowRate').textContent    = data.flow_rate.toFixed(1);
-        document.getElementById('targetFlow').textContent  = data.target_flow.toFixed(1);
-        document.getElementById('voltage').textContent     = data.voltage.toFixed(1);
-        document.getElementById('totalVolume').textContent = data.total_volume.toFixed(2);
-
-        if (data.flow_rate > 0 && data.running) {
-          var fd = document.getElementById('flowDot');
-          fd.style.opacity = '1';
-          setTimeout(function(){ fd.style.opacity = '0'; }, 300);
-        }
-
-        var sec = data.volume_time;
-        document.getElementById('elapsedTime').textContent =
-          String(Math.floor(sec / 60)).padStart(2, '0') + ':' + String(sec % 60).padStart(2, '0');
-
-        if (chart) {
-          actualData.shift(); actualData.push(data.flow_rate);
-          targetData.shift(); targetData.push(data.target_flow);
-          chart.update();
-        }
-
-      })
-      .catch(function(e) { console.error('Poll error:', e); })
-      .finally(function() { setTimeout(poll, 1000); });
-  }
-
-  poll();
-
-}); // end DOMContentLoaded
-</script>
-
-</body>
-</html>
+if __name__=='__main__':
+    try:app.run(host='0.0.0.0',port=5000,debug=False)
+    except KeyboardInterrupt:pass
+    finally:pwm.stop();GPIO.cleanup()
